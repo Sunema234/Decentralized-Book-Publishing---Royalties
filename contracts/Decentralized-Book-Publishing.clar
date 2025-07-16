@@ -9,6 +9,8 @@
 (define-constant ERR_BOOK_NOT_PUBLISHED (err u107))
 (define-constant ERR_REVIEW_ALREADY_EXISTS (err u108))
 (define-constant ERR_INVALID_RATING (err u109))
+(define-constant ERR_INVALID_DISCOUNT (err u110))
+(define-constant ERR_DISCOUNT_EXPIRED (err u111))
 
 (define-data-var next-book-id uint u1)
 (define-data-var platform-fee uint u250)
@@ -63,6 +65,16 @@
   }
 )
 
+(define-map book-discounts
+  { book-id: uint }
+  {
+    discount-percentage: uint,
+    start-height: uint,
+    end-height: uint,
+    is-active: bool
+  }
+)
+
 (define-public (publish-book (title (string-ascii 100)) (price uint) (royalty-rate uint) (content-hash (string-ascii 64)))
   (let (
     (book-id (var-get next-book-id))
@@ -108,27 +120,35 @@
   (let (
     (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
     (buyer tx-sender)
-    (price (get price book))
+    (base-price (get price book))
     (author (get author book))
     (royalty-rate (get royalty-rate book))
     (platform-fee-rate (var-get platform-fee))
     (current-height stacks-block-height)
+    (discount-info (map-get? book-discounts { book-id: book-id }))
   )
     (asserts! (get is-published book) ERR_BOOK_NOT_PUBLISHED)
     (asserts! (is-none (map-get? purchases { buyer: buyer, book-id: book-id })) ERR_PURCHASE_ALREADY_EXISTS)
     
     (let (
-      (platform-fee-amount (/ (* price platform-fee-rate) u10000))
-      (author-earnings (- price platform-fee-amount))
+      (final-price (match discount-info
+        discount-data (if (and (get is-active discount-data)
+                              (>= current-height (get start-height discount-data))
+                              (<= current-height (get end-height discount-data)))
+                         (- base-price (/ (* base-price (get discount-percentage discount-data)) u10000))
+                         base-price)
+        base-price))
+      (platform-fee-amount (/ (* final-price platform-fee-rate) u10000))
+      (author-earnings (- final-price platform-fee-amount))
     )
-      (try! (stx-transfer? price buyer (as-contract tx-sender)))
+      (try! (stx-transfer? final-price buyer (as-contract tx-sender)))
       (try! (as-contract (stx-transfer? author-earnings tx-sender author)))
       
       (map-set purchases
         { buyer: buyer, book-id: book-id }
         {
           purchased-at: current-height,
-          amount-paid: price
+          amount-paid: final-price
         }
       )
       
@@ -213,6 +233,44 @@
   )
 )
 
+(define-public (set-book-discount (book-id uint) (discount-percentage uint) (duration-blocks uint))
+  (let (
+    (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+    (current-height stacks-block-height)
+    (end-height (+ current-height duration-blocks))
+  )
+    (asserts! (is-eq tx-sender (get author book)) ERR_UNAUTHORIZED)
+    (asserts! (<= discount-percentage u9000) ERR_INVALID_DISCOUNT)
+    (asserts! (> duration-blocks u0) ERR_INVALID_DISCOUNT)
+    
+    (map-set book-discounts
+      { book-id: book-id }
+      {
+        discount-percentage: discount-percentage,
+        start-height: current-height,
+        end-height: end-height,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-book-discount (book-id uint))
+  (let (
+    (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+    (discount (unwrap! (map-get? book-discounts { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get author book)) ERR_UNAUTHORIZED)
+    
+    (map-set book-discounts
+      { book-id: book-id }
+      (merge discount { is-active: false })
+    )
+    (ok true)
+  )
+)
+
 (define-public (set-platform-fee (new-fee uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -252,6 +310,28 @@
 
 (define-read-only (get-platform-fee)
   (var-get platform-fee)
+)
+
+(define-read-only (get-book-discount (book-id uint))
+  (map-get? book-discounts { book-id: book-id })
+)
+
+(define-read-only (get-discounted-price (book-id uint))
+  (let (
+    (book (map-get? books { book-id: book-id }))
+    (discount (map-get? book-discounts { book-id: book-id }))
+    (current-height stacks-block-height)
+  )
+    (match book
+      book-data (match discount
+        discount-data (if (and (get is-active discount-data)
+                              (>= current-height (get start-height discount-data))
+                              (<= current-height (get end-height discount-data)))
+                         (some (- (get price book-data) (/ (* (get price book-data) (get discount-percentage discount-data)) u10000)))
+                         (some (get price book-data)))
+        (some (get price book-data)))
+      none)
+  )
 )
 
 (define-read-only (get-contract-balance)
