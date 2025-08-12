@@ -11,9 +11,13 @@
 (define-constant ERR_INVALID_RATING (err u109))
 (define-constant ERR_INVALID_DISCOUNT (err u110))
 (define-constant ERR_DISCOUNT_EXPIRED (err u111))
+(define-constant ERR_COLLECTION_NOT_FOUND (err u112))
+(define-constant ERR_COLLECTION_ALREADY_EXISTS (err u113))
+(define-constant ERR_BOOK_ALREADY_IN_COLLECTION (err u114))
 
 (define-data-var next-book-id uint u1)
 (define-data-var platform-fee uint u250)
+(define-data-var next-collection-id uint u1)
 
 (define-map books
   { book-id: uint }
@@ -72,6 +76,33 @@
     start-height: uint,
     end-height: uint,
     is-active: bool
+  }
+)
+
+(define-map book-collections
+  { collection-id: uint }
+  {
+    name: (string-ascii 100),
+    description: (string-ascii 500),
+    creator: principal,
+    created-at: uint,
+    total-books: uint,
+    is-active: bool
+  }
+)
+
+(define-map collection-books
+  { collection-id: uint, book-id: uint }
+  {
+    added-at: uint
+  }
+)
+
+(define-map book-collection-membership
+  { book-id: uint }
+  {
+    collection-id: uint,
+    position: uint
   }
 )
 
@@ -346,4 +377,130 @@
     (asserts! (> balance u0) ERR_INSUFFICIENT_PAYMENT)
     (as-contract (stx-transfer? balance tx-sender CONTRACT_OWNER))
   )
+)
+
+(define-public (create-collection (name (string-ascii 100)) (description (string-ascii 500)))
+  (let (
+    (collection-id (var-get next-collection-id))
+    (current-height stacks-block-height)
+  )
+    (map-set book-collections
+      { collection-id: collection-id }
+      {
+        name: name,
+        description: description,
+        creator: tx-sender,
+        created-at: current-height,
+        total-books: u0,
+        is-active: true
+      }
+    )
+    (var-set next-collection-id (+ collection-id u1))
+    (ok collection-id)
+  )
+)
+
+(define-public (add-book-to-collection (collection-id uint) (book-id uint))
+  (let (
+    (collection (unwrap! (map-get? book-collections { collection-id: collection-id }) ERR_COLLECTION_NOT_FOUND))
+    (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+    (current-height stacks-block-height)
+    (existing-membership (map-get? book-collection-membership { book-id: book-id }))
+  )
+    (asserts! (is-eq tx-sender (get creator collection)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq tx-sender (get author book)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active collection) ERR_COLLECTION_NOT_FOUND)
+    (asserts! (is-none existing-membership) ERR_BOOK_ALREADY_IN_COLLECTION)
+    
+    (map-set collection-books
+      { collection-id: collection-id, book-id: book-id }
+      {
+        added-at: current-height
+      }
+    )
+    
+    (map-set book-collection-membership
+      { book-id: book-id }
+      {
+        collection-id: collection-id,
+        position: (get total-books collection)
+      }
+    )
+    
+    (map-set book-collections
+      { collection-id: collection-id }
+      (merge collection {
+        total-books: (+ (get total-books collection) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-book-from-collection (collection-id uint) (book-id uint))
+  (let (
+    (collection (unwrap! (map-get? book-collections { collection-id: collection-id }) ERR_COLLECTION_NOT_FOUND))
+    (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+    (membership (unwrap! (map-get? book-collection-membership { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator collection)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get collection-id membership) collection-id) ERR_BOOK_NOT_FOUND)
+    
+    (map-delete collection-books { collection-id: collection-id, book-id: book-id })
+    (map-delete book-collection-membership { book-id: book-id })
+    
+    (map-set book-collections
+      { collection-id: collection-id }
+      (merge collection {
+        total-books: (- (get total-books collection) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (purchase-collection (collection-id uint))
+  (let (
+    (collection (unwrap! (map-get? book-collections { collection-id: collection-id }) ERR_COLLECTION_NOT_FOUND))
+    (buyer tx-sender)
+  )
+    (asserts! (get is-active collection) ERR_COLLECTION_NOT_FOUND)
+    (asserts! (> (get total-books collection) u0) ERR_BOOK_NOT_FOUND)
+    (ok collection-id)
+  )
+)
+
+(define-public (toggle-collection-status (collection-id uint))
+  (let (
+    (collection (unwrap! (map-get? book-collections { collection-id: collection-id }) ERR_COLLECTION_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator collection)) ERR_UNAUTHORIZED)
+    
+    (map-set book-collections
+      { collection-id: collection-id }
+      (merge collection {
+        is-active: (not (get is-active collection))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-collection (collection-id uint))
+  (map-get? book-collections { collection-id: collection-id })
+)
+
+(define-read-only (get-book-collection-info (book-id uint))
+  (map-get? book-collection-membership { book-id: book-id })
+)
+
+(define-read-only (is-book-in-collection (collection-id uint) (book-id uint))
+  (is-some (map-get? collection-books { collection-id: collection-id, book-id: book-id }))
+)
+
+(define-read-only (get-next-collection-id)
+  (var-get next-collection-id)
 )
