@@ -14,10 +14,17 @@
 (define-constant ERR_COLLECTION_NOT_FOUND (err u112))
 (define-constant ERR_COLLECTION_ALREADY_EXISTS (err u113))
 (define-constant ERR_BOOK_ALREADY_IN_COLLECTION (err u114))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u115))
+(define-constant ERR_SUBSCRIPTION_EXPIRED (err u116))
+(define-constant ERR_PLAN_NOT_FOUND (err u117))
+(define-constant ERR_PLAN_NOT_ACTIVE (err u118))
+(define-constant ERR_INVALID_DURATION (err u119))
+(define-constant ERR_SUBSCRIPTION_EXISTS (err u120))
 
 (define-data-var next-book-id uint u1)
 (define-data-var platform-fee uint u250)
 (define-data-var next-collection-id uint u1)
+(define-data-var next-subscription-plan-id uint u1)
 
 (define-map books
   { book-id: uint }
@@ -103,6 +110,49 @@
   {
     collection-id: uint,
     position: uint
+  }
+)
+
+(define-map subscription-plans
+  { plan-id: uint }
+  {
+    author: principal,
+    plan-name: (string-ascii 100),
+    monthly-price: uint,
+    yearly-price: uint,
+    max-books: uint,
+    created-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map user-subscriptions
+  { subscriber: principal, author: principal }
+  {
+    plan-id: uint,
+    subscribed-at: uint,
+    expires-at: uint,
+    total-paid: uint,
+    is-active: bool
+  }
+)
+
+(define-map reading-progress
+  { reader: principal, book-id: uint }
+  {
+    pages-read: uint,
+    total-pages: uint,
+    last-read-at: uint,
+    reading-sessions: uint,
+    completion-percentage: uint
+  }
+)
+
+(define-map subscription-access
+  { subscriber: principal, book-id: uint }
+  {
+    granted-at: uint,
+    access-type: (string-ascii 20)
   }
 )
 
@@ -503,4 +553,312 @@
 
 (define-read-only (get-next-collection-id)
   (var-get next-collection-id)
+)
+
+(define-public (create-subscription-plan 
+  (plan-name (string-ascii 100))
+  (monthly-price uint)
+  (yearly-price uint)
+  (max-books uint))
+  (let
+    (
+      (plan-id (var-get next-subscription-plan-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (> monthly-price u0) ERR_INVALID_PRICE)
+    (asserts! (> yearly-price u0) ERR_INVALID_PRICE)
+    (asserts! (> max-books u0) ERR_INVALID_DURATION)
+    (asserts! (< yearly-price (* monthly-price u12)) ERR_INVALID_PRICE)
+    
+    (map-set subscription-plans
+      { plan-id: plan-id }
+      {
+        author: tx-sender,
+        plan-name: plan-name,
+        monthly-price: monthly-price,
+        yearly-price: yearly-price,
+        max-books: max-books,
+        created-at: current-height,
+        is-active: true
+      }
+    )
+    (var-set next-subscription-plan-id (+ plan-id u1))
+    (ok plan-id)
+  )
+)
+
+(define-public (toggle-subscription-plan (plan-id uint))
+  (let
+    (
+      (plan (unwrap! (map-get? subscription-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get author plan)) ERR_UNAUTHORIZED)
+    
+    (map-set subscription-plans
+      { plan-id: plan-id }
+      (merge plan { is-active: (not (get is-active plan)) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-subscription-pricing 
+  (plan-id uint)
+  (new-monthly-price uint)
+  (new-yearly-price uint))
+  (let
+    (
+      (plan (unwrap! (map-get? subscription-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get author plan)) ERR_UNAUTHORIZED)
+    (asserts! (> new-monthly-price u0) ERR_INVALID_PRICE)
+    (asserts! (> new-yearly-price u0) ERR_INVALID_PRICE)
+    (asserts! (< new-yearly-price (* new-monthly-price u12)) ERR_INVALID_PRICE)
+    
+    (map-set subscription-plans
+      { plan-id: plan-id }
+      (merge plan {
+        monthly-price: new-monthly-price,
+        yearly-price: new-yearly-price
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (subscribe-to-author 
+  (plan-id uint)
+  (is-yearly bool))
+  (let
+    (
+      (plan (unwrap! (map-get? subscription-plans { plan-id: plan-id }) ERR_PLAN_NOT_FOUND))
+      (author (get author plan))
+      (subscriber tx-sender)
+      (current-height stacks-block-height)
+      (subscription-price (if is-yearly (get yearly-price plan) (get monthly-price plan)))
+      (duration-blocks (if is-yearly u52560 u4380))
+      (expires-at (+ current-height duration-blocks))
+      (platform-fee-amount (/ (* subscription-price (var-get platform-fee)) u10000))
+      (author-earnings (- subscription-price platform-fee-amount))
+      (existing-subscription (map-get? user-subscriptions { subscriber: subscriber, author: author }))
+    )
+    (asserts! (get is-active plan) ERR_PLAN_NOT_ACTIVE)
+    (asserts! (is-none existing-subscription) ERR_SUBSCRIPTION_EXISTS)
+    
+    (try! (stx-transfer? subscription-price subscriber (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? author-earnings tx-sender author)))
+    
+    (map-set user-subscriptions
+      { subscriber: subscriber, author: author }
+      {
+        plan-id: plan-id,
+        subscribed-at: current-height,
+        expires-at: expires-at,
+        total-paid: subscription-price,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (renew-subscription 
+  (author principal)
+  (is-yearly bool))
+  (let
+    (
+      (subscriber tx-sender)
+      (current-height stacks-block-height)
+      (existing-subscription (unwrap! (map-get? user-subscriptions { subscriber: subscriber, author: author }) ERR_SUBSCRIPTION_NOT_FOUND))
+      (plan (unwrap! (map-get? subscription-plans { plan-id: (get plan-id existing-subscription) }) ERR_PLAN_NOT_FOUND))
+      (subscription-price (if is-yearly (get yearly-price plan) (get monthly-price plan)))
+      (duration-blocks (if is-yearly u52560 u4380))
+      (new-expires-at (+ current-height duration-blocks))
+      (platform-fee-amount (/ (* subscription-price (var-get platform-fee)) u10000))
+      (author-earnings (- subscription-price platform-fee-amount))
+    )
+    (asserts! (get is-active plan) ERR_PLAN_NOT_ACTIVE)
+    
+    (try! (stx-transfer? subscription-price subscriber (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? author-earnings tx-sender author)))
+    
+    (map-set user-subscriptions
+      { subscriber: subscriber, author: author }
+      (merge existing-subscription {
+        expires-at: new-expires-at,
+        total-paid: (+ (get total-paid existing-subscription) subscription-price),
+        is-active: true
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (author principal))
+  (let
+    (
+      (subscriber tx-sender)
+      (existing-subscription (unwrap! (map-get? user-subscriptions { subscriber: subscriber, author: author }) ERR_SUBSCRIPTION_NOT_FOUND))
+    )
+    (asserts! (get is-active existing-subscription) ERR_SUBSCRIPTION_NOT_FOUND)
+    
+    (map-set user-subscriptions
+      { subscriber: subscriber, author: author }
+      (merge existing-subscription { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (start-reading-session 
+  (book-id uint)
+  (total-pages uint))
+  (let
+    (
+      (reader tx-sender)
+      (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+      (author (get author book))
+      (current-height stacks-block-height)
+      (has-purchased (is-some (map-get? purchases { buyer: reader, book-id: book-id })))
+      (has-subscription (match (map-get? user-subscriptions { subscriber: reader, author: author })
+        sub-info (and (get is-active sub-info) (< current-height (get expires-at sub-info)))
+        false))
+      (existing-progress (map-get? reading-progress { reader: reader, book-id: book-id }))
+    )
+    (asserts! (get is-published book) ERR_BOOK_NOT_PUBLISHED)
+    (asserts! (or has-purchased has-subscription) ERR_UNAUTHORIZED)
+    (asserts! (> total-pages u0) ERR_INVALID_DURATION)
+    
+    (match existing-progress
+      progress-data
+        (map-set reading-progress
+          { reader: reader, book-id: book-id }
+          (merge progress-data {
+            total-pages: total-pages,
+            last-read-at: current-height,
+            reading-sessions: (+ (get reading-sessions progress-data) u1)
+          })
+        )
+      (map-set reading-progress
+        { reader: reader, book-id: book-id }
+        {
+          pages-read: u0,
+          total-pages: total-pages,
+          last-read-at: current-height,
+          reading-sessions: u1,
+          completion-percentage: u0
+        }
+      )
+    )
+    
+    (if has-subscription
+      (map-set subscription-access
+        { subscriber: reader, book-id: book-id }
+        {
+          granted-at: current-height,
+          access-type: "subscription"
+        }
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-reading-progress 
+  (book-id uint)
+  (pages-read uint))
+  (let
+    (
+      (reader tx-sender)
+      (current-height stacks-block-height)
+      (existing-progress (unwrap! (map-get? reading-progress { reader: reader, book-id: book-id }) ERR_BOOK_NOT_FOUND))
+      (total-pages (get total-pages existing-progress))
+      (completion-percentage (if (> total-pages u0) (/ (* pages-read u100) total-pages) u0))
+    )
+    (asserts! (<= pages-read total-pages) ERR_INVALID_DURATION)
+    
+    (map-set reading-progress
+      { reader: reader, book-id: book-id }
+      (merge existing-progress {
+        pages-read: pages-read,
+        last-read-at: current-height,
+        completion-percentage: completion-percentage
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription-plan (plan-id uint))
+  (map-get? subscription-plans { plan-id: plan-id })
+)
+
+(define-read-only (get-user-subscription (subscriber principal) (author principal))
+  (map-get? user-subscriptions { subscriber: subscriber, author: author })
+)
+
+(define-read-only (get-reading-progress (reader principal) (book-id uint))
+  (map-get? reading-progress { reader: reader, book-id: book-id })
+)
+
+(define-read-only (get-subscription-access (subscriber principal) (book-id uint))
+  (map-get? subscription-access { subscriber: subscriber, book-id: book-id })
+)
+
+(define-read-only (has-active-subscription (subscriber principal) (author principal))
+  (match (map-get? user-subscriptions { subscriber: subscriber, author: author })
+    sub-info
+      (and 
+        (get is-active sub-info)
+        (< stacks-block-height (get expires-at sub-info))
+      )
+    false
+  )
+)
+
+(define-read-only (can-access-book (reader principal) (book-id uint))
+  (let
+    (
+      (book (map-get? books { book-id: book-id }))
+      (has-purchased (is-some (map-get? purchases { buyer: reader, book-id: book-id })))
+    )
+    (match book
+      book-data
+        (let
+          (
+            (author (get author book-data))
+            (has-subscription (has-active-subscription reader author))
+          )
+          (or has-purchased has-subscription)
+        )
+      false
+    )
+  )
+)
+
+(define-read-only (get-subscription-status (subscriber principal) (author principal))
+  (match (map-get? user-subscriptions { subscriber: subscriber, author: author })
+    sub-info
+      (let
+        (
+          (current-height stacks-block-height)
+          (is-expired (>= current-height (get expires-at sub-info)))
+          (blocks-remaining (if is-expired u0 (- (get expires-at sub-info) current-height)))
+        )
+        (some {
+          plan-id: (get plan-id sub-info),
+          is-active: (get is-active sub-info),
+          expires-at: (get expires-at sub-info),
+          is-expired: is-expired,
+          blocks-remaining: blocks-remaining,
+          total-paid: (get total-paid sub-info)
+        })
+      )
+    none
+  )
+)
+
+(define-read-only (get-next-subscription-plan-id)
+  (var-get next-subscription-plan-id)
 )
