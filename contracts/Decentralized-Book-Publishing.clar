@@ -20,11 +20,19 @@
 (define-constant ERR_PLAN_NOT_ACTIVE (err u118))
 (define-constant ERR_INVALID_DURATION (err u119))
 (define-constant ERR_SUBSCRIPTION_EXISTS (err u120))
+(define-constant ERR_CAMPAIGN_NOT_FOUND (err u121))
+(define-constant ERR_CAMPAIGN_ENDED (err u122))
+(define-constant ERR_CAMPAIGN_ACTIVE (err u123))
+(define-constant ERR_GOAL_NOT_MET (err u124))
+(define-constant ERR_ALREADY_PREORDERED (err u125))
+(define-constant ERR_CAMPAIGN_FUNDED (err u126))
+(define-constant ERR_NO_REFUND_AVAILABLE (err u127))
 
 (define-data-var next-book-id uint u1)
 (define-data-var platform-fee uint u250)
 (define-data-var next-collection-id uint u1)
 (define-data-var next-subscription-plan-id uint u1)
+(define-data-var next-preorder-campaign-id uint u1)
 
 (define-map books
   { book-id: uint }
@@ -153,6 +161,42 @@
   {
     granted-at: uint,
     access-type: (string-ascii 20)
+  }
+)
+
+(define-map preorder-campaigns
+  { campaign-id: uint }
+  {
+    title: (string-ascii 100),
+    author: principal,
+    preorder-price: uint,
+    funding-goal: uint,
+    current-funding: uint,
+    total-preorders: uint,
+    deadline: uint,
+    campaign-start: uint,
+    is-active: bool,
+    is-funded: bool,
+    is-completed: bool,
+    content-hash: (string-ascii 64),
+    description: (string-ascii 500)
+  }
+)
+
+(define-map preorder-purchases
+  { campaign-id: uint, buyer: principal }
+  {
+    amount-paid: uint,
+    preordered-at: uint,
+    is-refunded: bool
+  }
+)
+
+(define-map campaign-backers
+  { campaign-id: uint }
+  {
+    backer-count: uint,
+    total-raised: uint
   }
 )
 
@@ -861,4 +905,264 @@
 
 (define-read-only (get-next-subscription-plan-id)
   (var-get next-subscription-plan-id)
+)
+
+(define-public (create-preorder-campaign
+  (title (string-ascii 100))
+  (preorder-price uint)
+  (funding-goal uint)
+  (duration-blocks uint)
+  (content-hash (string-ascii 64))
+  (description (string-ascii 500)))
+  (let
+    (
+      (campaign-id (var-get next-preorder-campaign-id))
+      (current-height stacks-block-height)
+      (deadline (+ current-height duration-blocks))
+    )
+    (asserts! (> preorder-price u0) ERR_INVALID_PRICE)
+    (asserts! (> funding-goal u0) ERR_INVALID_PRICE)
+    (asserts! (> duration-blocks u0) ERR_INVALID_DURATION)
+    
+    (map-set preorder-campaigns
+      { campaign-id: campaign-id }
+      {
+        title: title,
+        author: tx-sender,
+        preorder-price: preorder-price,
+        funding-goal: funding-goal,
+        current-funding: u0,
+        total-preorders: u0,
+        deadline: deadline,
+        campaign-start: current-height,
+        is-active: true,
+        is-funded: false,
+        is-completed: false,
+        content-hash: content-hash,
+        description: description
+      }
+    )
+    
+    (map-set campaign-backers
+      { campaign-id: campaign-id }
+      {
+        backer-count: u0,
+        total-raised: u0
+      }
+    )
+    
+    (var-set next-preorder-campaign-id (+ campaign-id u1))
+    (ok campaign-id)
+  )
+)
+
+(define-public (preorder-book (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? preorder-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (buyer tx-sender)
+      (current-height stacks-block-height)
+      (preorder-price (get preorder-price campaign))
+      (existing-preorder (map-get? preorder-purchases { campaign-id: campaign-id, buyer: buyer }))
+    )
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_ENDED)
+    (asserts! (< current-height (get deadline campaign)) ERR_CAMPAIGN_ENDED)
+    (asserts! (is-none existing-preorder) ERR_ALREADY_PREORDERED)
+    
+    (try! (stx-transfer? preorder-price buyer (as-contract tx-sender)))
+    
+    (map-set preorder-purchases
+      { campaign-id: campaign-id, buyer: buyer }
+      {
+        amount-paid: preorder-price,
+        preordered-at: current-height,
+        is-refunded: false
+      }
+    )
+    
+    (let
+      (
+        (new-funding (+ (get current-funding campaign) preorder-price))
+        (new-preorder-count (+ (get total-preorders campaign) u1))
+        (is-now-funded (>= new-funding (get funding-goal campaign)))
+      )
+      (map-set preorder-campaigns
+        { campaign-id: campaign-id }
+        (merge campaign {
+          current-funding: new-funding,
+          total-preorders: new-preorder-count,
+          is-funded: is-now-funded
+        })
+      )
+      
+      (let
+        (
+          (backers (unwrap! (map-get? campaign-backers { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+        )
+        (map-set campaign-backers
+          { campaign-id: campaign-id }
+          {
+            backer-count: (+ (get backer-count backers) u1),
+            total-raised: new-funding
+          }
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-preorder-campaign (campaign-id uint) (published-book-id uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? preorder-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (book (unwrap! (map-get? books { book-id: published-book-id }) ERR_BOOK_NOT_FOUND))
+      (current-height stacks-block-height)
+      (platform-fee-amount (/ (* (get current-funding campaign) (var-get platform-fee)) u10000))
+      (author-earnings (- (get current-funding campaign) platform-fee-amount))
+    )
+    (asserts! (is-eq tx-sender (get author campaign)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq tx-sender (get author book)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_ENDED)
+    (asserts! (>= current-height (get deadline campaign)) ERR_CAMPAIGN_ACTIVE)
+    (asserts! (get is-funded campaign) ERR_GOAL_NOT_MET)
+    (asserts! (not (get is-completed campaign)) ERR_CAMPAIGN_ENDED)
+    
+    (try! (as-contract (stx-transfer? author-earnings tx-sender (get author campaign))))
+    
+    (map-set preorder-campaigns
+      { campaign-id: campaign-id }
+      (merge campaign {
+        is-active: false,
+        is-completed: true
+      })
+    )
+    
+    (let ((current-stats (default-to { total-books: u0, total-earnings: u0, total-sales: u0 } 
+                          (map-get? author-stats { author: (get author campaign) }))))
+      (map-set author-stats
+        { author: (get author campaign) }
+        {
+          total-books: (get total-books current-stats),
+          total-earnings: (+ (get total-earnings current-stats) author-earnings),
+          total-sales: (+ (get total-sales current-stats) (get total-preorders campaign))
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-preorder-campaign (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? preorder-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get author campaign)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_ENDED)
+    (asserts! (or 
+      (>= current-height (get deadline campaign))
+      (not (get is-funded campaign))) ERR_CAMPAIGN_FUNDED)
+    
+    (map-set preorder-campaigns
+      { campaign-id: campaign-id }
+      (merge campaign {
+        is-active: false
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-preorder-refund (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? preorder-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (buyer tx-sender)
+      (current-height stacks-block-height)
+      (preorder (unwrap! (map-get? preorder-purchases { campaign-id: campaign-id, buyer: buyer }) ERR_BOOK_NOT_FOUND))
+    )
+    (asserts! (not (get is-active campaign)) ERR_CAMPAIGN_ACTIVE)
+    (asserts! (not (get is-funded campaign)) ERR_CAMPAIGN_FUNDED)
+    (asserts! (not (get is-refunded preorder)) ERR_NO_REFUND_AVAILABLE)
+    (asserts! (>= current-height (get deadline campaign)) ERR_CAMPAIGN_ACTIVE)
+    
+    (try! (as-contract (stx-transfer? (get amount-paid preorder) tx-sender buyer)))
+    
+    (map-set preorder-purchases
+      { campaign-id: campaign-id, buyer: buyer }
+      (merge preorder { is-refunded: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (grant-preorder-access (campaign-id uint) (book-id uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? preorder-campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+      (buyer tx-sender)
+      (preorder (unwrap! (map-get? preorder-purchases { campaign-id: campaign-id, buyer: buyer }) ERR_BOOK_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (get is-completed campaign) ERR_CAMPAIGN_ACTIVE)
+    (asserts! (is-eq (get author book) (get author campaign)) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-refunded preorder)) ERR_NO_REFUND_AVAILABLE)
+    (asserts! (is-none (map-get? purchases { buyer: buyer, book-id: book-id })) ERR_PURCHASE_ALREADY_EXISTS)
+    
+    (map-set purchases
+      { buyer: buyer, book-id: book-id }
+      {
+        purchased-at: current-height,
+        amount-paid: (get amount-paid preorder)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-preorder-campaign (campaign-id uint))
+  (map-get? preorder-campaigns { campaign-id: campaign-id })
+)
+
+(define-read-only (get-preorder-purchase (campaign-id uint) (buyer principal))
+  (map-get? preorder-purchases { campaign-id: campaign-id, buyer: buyer })
+)
+
+(define-read-only (get-campaign-backers (campaign-id uint))
+  (map-get? campaign-backers { campaign-id: campaign-id })
+)
+
+(define-read-only (get-campaign-progress (campaign-id uint))
+  (match (map-get? preorder-campaigns { campaign-id: campaign-id })
+    campaign
+      (let
+        (
+          (funding-percentage (/ (* (get current-funding campaign) u100) (get funding-goal campaign)))
+          (blocks-remaining (if (< stacks-block-height (get deadline campaign))
+                             (- (get deadline campaign) stacks-block-height)
+                             u0))
+        )
+        (some {
+          current-funding: (get current-funding campaign),
+          funding-goal: (get funding-goal campaign),
+          funding-percentage: funding-percentage,
+          total-preorders: (get total-preorders campaign),
+          is-funded: (get is-funded campaign),
+          is-active: (get is-active campaign),
+          blocks-remaining: blocks-remaining
+        })
+      )
+    none
+  )
+)
+
+(define-read-only (has-preordered (campaign-id uint) (buyer principal))
+  (is-some (map-get? preorder-purchases { campaign-id: campaign-id, buyer: buyer }))
+)
+
+(define-read-only (get-next-preorder-campaign-id)
+  (var-get next-preorder-campaign-id)
 )
