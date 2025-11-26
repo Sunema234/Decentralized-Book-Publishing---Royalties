@@ -27,6 +27,7 @@
 (define-constant ERR_ALREADY_PREORDERED (err u125))
 (define-constant ERR_CAMPAIGN_FUNDED (err u126))
 (define-constant ERR_NO_REFUND_AVAILABLE (err u127))
+(define-constant ERR_CANNOT_GIFT_TO_SELF (err u128))
 
 (define-data-var next-book-id uint u1)
 (define-data-var platform-fee uint u250)
@@ -197,6 +198,14 @@
   {
     backer-count: uint,
     total-raised: uint
+  }
+)
+
+(define-map gift-receipts
+  { recipient: principal, book-id: uint }
+  {
+    sender: principal,
+    gifted-at: uint
   }
 )
 
@@ -1165,4 +1174,77 @@
 
 (define-read-only (get-next-preorder-campaign-id)
   (var-get next-preorder-campaign-id)
+)
+
+(define-public (gift-book (book-id uint) (recipient principal))
+  (let (
+    (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+    (sender tx-sender)
+    (base-price (get price book))
+    (author (get author book))
+    (platform-fee-rate (var-get platform-fee))
+    (current-height stacks-block-height)
+    (discount-info (map-get? book-discounts { book-id: book-id }))
+  )
+    (asserts! (not (is-eq sender recipient)) ERR_CANNOT_GIFT_TO_SELF)
+    (asserts! (get is-published book) ERR_BOOK_NOT_PUBLISHED)
+    (asserts! (is-none (map-get? purchases { buyer: recipient, book-id: book-id })) ERR_PURCHASE_ALREADY_EXISTS)
+    
+    (let (
+      (final-price (match discount-info
+        discount-data (if (and (get is-active discount-data)
+                              (>= current-height (get start-height discount-data))
+                              (<= current-height (get end-height discount-data)))
+                         (- base-price (/ (* base-price (get discount-percentage discount-data)) u10000))
+                         base-price)
+        base-price))
+      (platform-fee-amount (/ (* final-price platform-fee-rate) u10000))
+      (author-earnings (- final-price platform-fee-amount))
+    )
+      (try! (stx-transfer? final-price sender (as-contract tx-sender)))
+      (try! (as-contract (stx-transfer? author-earnings tx-sender author)))
+      
+      (map-set purchases
+        { buyer: recipient, book-id: book-id }
+        {
+          purchased-at: current-height,
+          amount-paid: final-price
+        }
+      )
+
+      (map-set gift-receipts
+        { recipient: recipient, book-id: book-id }
+        {
+          sender: sender,
+          gifted-at: current-height
+        }
+      )
+      
+      (map-set books
+        { book-id: book-id }
+        (merge book {
+          total-sales: (+ (get total-sales book) u1),
+          total-earnings: (+ (get total-earnings book) author-earnings)
+        })
+      )
+      
+      (let ((author-current-stats (default-to { total-books: u0, total-earnings: u0, total-sales: u0 } 
+                                   (map-get? author-stats { author: author }))))
+        (map-set author-stats
+          { author: author }
+          {
+            total-books: (get total-books author-current-stats),
+            total-earnings: (+ (get total-earnings author-current-stats) author-earnings),
+            total-sales: (+ (get total-sales author-current-stats) u1)
+          }
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-gift-receipt (recipient principal) (book-id uint))
+  (map-get? gift-receipts { recipient: recipient, book-id: book-id })
 )
